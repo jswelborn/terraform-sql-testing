@@ -1,134 +1,212 @@
 <#
 .SYNOPSIS
-    Fully automated post-deployment SQL Server configuration for Azure SQL VMs.
+  Idempotent post-deployment SQL Server configuration for Azure SQL VMs.
 
 .DESCRIPTION
-    - Rebuilds system DBs with custom collation
-    - Enables SA account (temporary password)
-    - Sets default data/log directories
-    - Moves TempDB
-    - Configures MAXDOP, memory, and ad hoc workloads
-    - Waits for SQL to become available before applying changes
-    - Logs all actions to C:\Temp\sql_post_config.log
+  - Detects proper instance registry path (MSSQL###.MSSQLSERVER)
+  - Rebuilds system DBs to desired collation (first time only; guarded by marker)
+  - Waits for data/log drives to appear
+  - Writes DefaultData / DefaultLog in registry
+  - Tries to apply sp_configure + TempDB move via Windows auth (best-effort)
+  - Logs all actions to C:\Temp\sql_post_config.log
 #>
 
 $ErrorActionPreference = 'Stop'
-$LogFile = "C:\Temp\sql_post_config.log"
-New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null
+$LogDir  = 'C:\Temp'
+$LogFile = Join-Path $LogDir 'sql_post_config.log'
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
-Function Write-Log($msg) {
-    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    "$timestamp :: $msg" | Tee-Object -FilePath $LogFile -Append
+function Write-Log {
+  param([string]$Message)
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  "$ts :: $Message" | Tee-Object -FilePath $LogFile -Append
 }
 
 Write-Log "=== SQL Post-Config Script Started ==="
 
+# ------------------ Tunables ------------------
+$InstanceName   = 'MSSQLSERVER'
+$DesiredCollation = 'SQL_Latin1_General_CP1_CS_AS'
+$DataDrive      = 'F'       
+$LogDrive       = 'G'       
+$TempDBDrive    = 'F'      
+$MaxMemoryMB    = 2147483647
+$MinMemoryMB    = 0
+$MaxDOP         = 0
+$OptimizeAdHoc  = 1
+$RebuildMarker  = 'C:\Temp\_sql_rebuild_done.flag'
+# ------------------------------------------------
+
+function Get-SetupExe {
+  $setup = Get-ChildItem -Path "C:\Program Files\Microsoft SQL Server\" -Recurse -Filter Setup.exe -ErrorAction SilentlyContinue |
+           Where-Object { $_.FullName -match 'Setup Bootstrap' } |
+           Select-Object -First 1
+  if (-not $setup) { throw "Could not locate SQL setup executable." }
+  $setup.FullName
+}
+
+function Get-InstanceKey {
+  $root = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\'
+  $key  = Get-ChildItem $root -ErrorAction SilentlyContinue |
+          Where-Object { $_.PSChildName -match '^MSSQL\d{3}\.MSSQLSERVER$' } |
+          Select-Object -ExpandProperty PSChildName -First 1
+  if (-not $key) {
+    # Fallback: try to read from instance names map
+    $map = Get-ItemProperty "${root}Instance Names\SQL" -ErrorAction SilentlyContinue
+    if ($map -and $map.MSSQLSERVER) { $key = $map.MSSQLSERVER }
+  }
+  if (-not $key) { throw "Could not determine instance key under Microsoft SQL Server registry hive." }
+  $key
+}
+
+function Get-RegBase {
+  param([string]$InstanceKey)
+  "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\${InstanceKey}\MSSQLServer"
+}
+
+function Drive-Ready {
+  param([string]${DriveLetter}) # 'F' or 'G'
+  Test-Path ("{0}:" -f ${DriveLetter})
+}
+
+function Wait-ForDrive {
+  param([string]${DriveLetter}, [int]$TimeoutSec = 900)
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  while (-not (Drive-Ready ${DriveLetter})) {
+    if (Get-Date -gt $deadline) { return $false }
+    Write-Log "Drive ${DriveLetter}: not ready, waiting 30s..."
+    Start-Sleep -Seconds 30
+  }
+  return $true
+}
+
+function Sql-Try {
+  param([string]$Query, [int]$Timeout = 15)
+  try {
+    # -E Windows auth, -C trust server cert, -l login timeout
+    sqlcmd -S localhost -E -C -l $Timeout -W -Q $Query | Out-Null
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 try {
-    # --- Configuration Values ---
-    $Instance = "MSSQLSERVER"
-    $Collation = "SQL_Latin1_General_CP1_CS_AS"
-    $TempSAPassword = "ChangeMe123!"
-    $MaxMemoryMB = 2147483647
-    $MinMemoryMB = 0
-    $MaxDOP = 0
-    $OptimizeAdHoc = 1
-    $DataDrive = "F"
-    $LogDrive = "G"
-    $TempDBDrive = "F"
+  # 1) Detect setup + instance key + reg base
+  $setupExe    = Get-SetupExe
+  Write-Log "Found SQL setup at: $setupExe"
 
-    # --- Detect SQL Setup Path ---
-    $setup = Get-ChildItem -Path "C:\Program Files\Microsoft SQL Server\" -Recurse -Filter Setup.exe -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match "Setup Bootstrap" } | Select-Object -First 1
-    if (-not $setup) { throw "Could not locate SQL setup executable." }
+  $instanceKey = Get-InstanceKey
+  $regBase     = Get-RegBase -InstanceKey $instanceKey
+  Write-Log "Instance registry base: $regBase"
 
-    Write-Log "Found SQL setup at: $($setup.FullName)"
+  # 2) Read current collation from registry (no SQL login needed)
+  $currentCollation = ''
+  try {
+    $props = Get-ItemProperty -Path $regBase -ErrorAction Stop
+    $currentCollation = $props.Collation
+  } catch { }
+  if ([string]::IsNullOrWhiteSpace($currentCollation)) { $currentCollation = 'Unknown' }
+  Write-Log "Current (registry) collation: $currentCollation"
 
-    # --- Detect current collation ---
-    try {
-        $currentCollation = sqlcmd -S localhost -E -C -h-1 -W -Q "SELECT SERVERPROPERTY('Collation')" 2>$null
-        Write-Log "Current SQL collation: $currentCollation"
-    } catch {
-        Write-Log "Could not detect current collation (may be first run)."
-    }
-
-    # --- Rebuild system DBs with correct collation ---
-    Write-Log "Rebuilding system databases with collation $Collation..."
-    & $setup.FullName /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=$Instance /SQLSYSADMINACCOUNTS="Administrators" /SQLCOLLATION=$Collation
-    Write-Log "System databases rebuilt successfully."
+  # 3) Rebuild system DBs if needed (guarded by marker + different collation)
+  $needRebuild = (-not (Test-Path $RebuildMarker)) -and ($currentCollation -ne $DesiredCollation)
+  if ($needRebuild) {
+    Write-Log "Rebuilding system databases to collation $DesiredCollation..."
+    & $setupExe /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=$InstanceName /SQLSYSADMINACCOUNTS="Administrators" /SQLCOLLATION=$DesiredCollation
+    Write-Log "System databases rebuild requested."
     Restart-Service MSSQLSERVER -Force
     Write-Log "SQL Server restarted after rebuild."
+    New-Item -ItemType File -Path $RebuildMarker -Force | Out-Null
+  } else {
+    Write-Log "Rebuild not required (marker present or collation already matches)."
+  }
 
-    # --- Wait for SQL to become available ---
-    Write-Log "Waiting for SQL to accept connections..."
-    for ($i = 1; $i -le 10; $i++) {
-        try {
-            sqlcmd -S localhost -E -C -Q "SELECT 1" -W | Out-Null
-            Write-Log "SQL is online and accepting connections."
-            break
-        } catch {
-            Write-Log "SQL not ready yet (attempt $i/10)..."
-            Start-Sleep -Seconds 30
-        }
-        if ($i -eq 10) { throw "SQL Server did not start within timeout window." }
+  # 4) Wait for SQL to be reachable (best-effort)
+  Write-Log "Waiting for SQL to accept connections..."
+  $online = $false
+  for ($i=1; $i -le 10; $i++) {
+    if (Sql-Try "SELECT 1") { $online = $true; break }
+    Write-Log "SQL not ready yet (attempt $i/10)..."
+    Start-Sleep -Seconds 30
+  }
+  if ($online) { Write-Log "SQL is online and accepting connections." }
+  else { Write-Log "SQL did not become reachable in time; will continue with registry-based steps." }
+
+  # 5) Ensure drives exist, then create folders
+  foreach ($drv in @($DataDrive, $LogDrive, $TempDBDrive)) {
+    if (-not (Wait-ForDrive $drv 900)) { throw "Drive $drv never became ready." }
+  }
+
+  $DataPath   = "${DataDrive}:\Data"
+  $LogPath    = "${LogDrive}:\Log"
+  $TempDBPath = "${TempDBDrive}:\TempDB"
+
+  foreach ($p in @($DataPath,$LogPath,$TempDBPath)) {
+    if (-not (Test-Path $p)) {
+      Write-Log "Creating directory: $p"
+      New-Item -ItemType Directory -Path $p -Force | Out-Null
     }
+  }
 
-    # --- Enable SA login ---
-    Write-Log "Ensuring 'sa' login is enabled..."
-    sqlcmd -S localhost -E -C -Q "ALTER LOGIN sa ENABLE; ALTER LOGIN sa WITH PASSWORD = '$TempSAPassword'; ALTER LOGIN sa WITH CHECK_POLICY = OFF;"
-    Write-Log "'sa' login enabled with temporary password '$TempSAPassword'."
+  # 6) Set DefaultData / DefaultLog in registry (no SQL login required)
+  Write-Log "Writing DefaultData/DefaultLog to registry at $regBase"
+  Set-ItemProperty -Path $regBase -Name 'DefaultData' -Value $DataPath -Force
+  Set-ItemProperty -Path $regBase -Name 'DefaultLog'  -Value $LogPath  -Force
 
-    # --- Create drive paths ---
-    foreach ($drive in @($DataDrive, $LogDrive, $TempDBDrive)) {
-        foreach ($folder in @("Data", "Log", "TempDB")) {
-            $path = "$drive`:\$folder"
-            if (!(Test-Path $path)) {
-                Write-Log "Creating directory: $path"
-                New-Item -ItemType Directory -Path $path -Force | Out-Null
-            }
-        }
+  # 7) If SQL reachable, apply performance settings + move TempDB (best-effort)
+  if ($online) {
+    Write-Log "Applying sp_configure settings..."
+    [void](Sql-Try "EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE;")
+    [void](Sql-Try "EXEC sys.sp_configure N'max degree of parallelism', $MaxDOP; RECONFIGURE;")
+    [void](Sql-Try "EXEC sys.sp_configure N'optimize for ad hoc workloads', $OptimizeAdHoc; RECONFIGURE;")
+    [void](Sql-Try "EXEC sys.sp_configure N'min server memory (MB)', $MinMemoryMB; RECONFIGURE;")
+    [void](Sql-Try "EXEC sys.sp_configure N'max server memory (MB)', $MaxMemoryMB; RECONFIGURE;")
+    Write-Log "sp_configure applied (if permissions allowed)."
+
+    Write-Log "Moving TempDB to $TempDBPath (if permitted)..."
+    $tempMove = @"
+ALTER DATABASE tempdb MODIFY FILE (NAME = tempdev, FILENAME = '$TempDBPath\tempdb.mdf');
+ALTER DATABASE tempdb MODIFY FILE (NAME = templog, FILENAME = '$TempDBPath\templog.ldf');
+"@
+    [void](Sql-Try $tempMove)
+    Write-Log "TempDB move submitted (takes effect after restart if successful)."
+
+    try {
+      Restart-Service MSSQLSERVER -Force
+      Write-Log "SQL restarted to apply TempDB/perf changes."
+    } catch {
+      Write-Log "Warning: could not restart SQL service automatically: $($_.Exception.Message)"
     }
+  } else {
+    Write-Log "Skipping sp_configure and TempDB move (SQL not reachable with current context)."
+  }
 
-    # --- Update default data/log directories in registry ---
-    Write-Log "Setting default data/log paths in SQL registry..."
-    sqlcmd -S localhost -E -C -Q "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQLServer', N'DefaultData', REG_SZ, '$DataDrive`:\Data';"
-    sqlcmd -S localhost -E -C -Q "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQLServer', N'DefaultLog', REG_SZ, '$LogDrive`:\Log';"
-    Write-Log "Registry paths updated."
+  # 8) Verification (best-effort)
+  try {
+    $props2 = Get-ItemProperty -Path $regBase -ErrorAction Stop
+    Write-Log "Registry verification: Collation='$($props2.Collation)', DefaultData='$($props2.DefaultData)', DefaultLog='$($props2.DefaultLog)'"
+  } catch {
+    Write-Log "Registry verification failed: $($_.Exception.Message)"
+  }
 
-    # --- Apply performance configuration ---
-    Write-Log "Applying SQL configuration (MAXDOP, memory, ad hoc)..."
-    sqlcmd -S localhost -E -C -Q "EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE;"
-    sqlcmd -S localhost -E -C -Q "EXEC sys.sp_configure N'max degree of parallelism', $MaxDOP; RECONFIGURE;"
-    sqlcmd -S localhost -E -C -Q "EXEC sys.sp_configure N'optimize for ad hoc workloads', $OptimizeAdHoc; RECONFIGURE;"
-    sqlcmd -S localhost -E -C -Q "EXEC sys.sp_configure N'min server memory (MB)', $MinMemoryMB; RECONFIGURE;"
-    sqlcmd -S localhost -E -C -Q "EXEC sys.sp_configure N'max server memory (MB)', $MaxMemoryMB; RECONFIGURE;"
-    Write-Log "SQL configuration applied successfully."
+  if ($online) {
+    try {
+      $finalColl = sqlcmd -S localhost -E -C -h-1 -W -Q "SELECT SERVERPROPERTY('Collation')" 2>$null
+      Write-Log "SQL verification: Collation (SERVERPROPERTY)='$finalColl'"
+      $tempdbFiles = sqlcmd -S localhost -E -C -W -Q "SET NOCOUNT ON; SELECT name, physical_name FROM sys.master_files WHERE database_id = DB_ID('tempdb');"
+      Write-Log "SQL verification: TempDB files:`n$tempdbFiles"
+    } catch {
+      Write-Log "SQL verification failed: $($_.Exception.Message)"
+    }
+  }
 
-    # --- Move TempDB ---
-    Write-Log "Moving TempDB to $TempDBDrive:\TempDB..."
-    sqlcmd -S localhost -E -C -Q "
-    ALTER DATABASE tempdb MODIFY FILE (NAME = tempdev, FILENAME = '$TempDBDrive`:\TempDB\tempdb.mdf');
-    ALTER DATABASE tempdb MODIFY FILE (NAME = templog, FILENAME = '$TempDBDrive`:\TempDB\templog.ldf');"
-    Write-Log "TempDB location updated. Restart SQL to apply."
-
-    # --- Restart SQL to finalize changes ---
-    Restart-Service MSSQLSERVER -Force
-    Write-Log "SQL Server restarted to apply all configuration changes."
-
-    # --- Verify and log summary ---
-    $collation = sqlcmd -S localhost -E -C -h-1 -W -Q "SELECT SERVERPROPERTY('Collation')"
-    Write-Log "Final collation: $collation"
-
-    $paths = sqlcmd -S localhost -E -C -W -Q "
-    EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQLServer', N'DefaultData';
-    EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQLServer', N'DefaultLog';"
-    Write-Log "Default path check:`n$paths"
-
-    Write-Log "=== SQL Post-Config Script Completed Successfully ==="
+  Write-Log "=== SQL Post-Config Script Completed Successfully ==="
 }
 catch {
-    Write-Log "ERROR: $($_.Exception.Message)"
-    throw
+  Write-Log "ERROR: $($_.Exception.Message)"
+  throw
 }
 finally {
-    Write-Log "=== SQL Post-Config Script Finished ==="
+  Write-Log "=== SQL Post-Config Script Finished ==="
 }
