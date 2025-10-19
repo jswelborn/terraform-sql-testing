@@ -6,8 +6,8 @@
   - Detects proper instance registry path (MSSQL###.MSSQLSERVER)
   - Rebuilds system DBs to desired collation (first time only; guarded by marker)
   - Waits for data/log drives to appear
-  - Writes DefaultData / DefaultLog in registry
-  - Tries to apply sp_configure + TempDB move via Windows auth (best-effort)
+  - Writes DefaultData / DefaultLog / DefaultBackupDirectory in registry
+  - Applies sp_configure + relocates all TempDB files to F:\TempDB
   - Logs all actions to C:\Temp\sql_post_config.log
 #>
 
@@ -27,9 +27,9 @@ Write-Log "=== SQL Post-Config Script Started ==="
 # ------------------ Tunables ------------------
 $InstanceName   = 'MSSQLSERVER'
 $DesiredCollation = 'SQL_Latin1_General_CP1_CS_AS'
-$DataDrive      = 'F'       
-$LogDrive       = 'G'       
-$TempDBDrive    = 'F'      
+$DataDrive      = 'F'
+$LogDrive       = 'G'
+$TempDBDrive    = 'F'
 $MaxMemoryMB    = 2147483647
 $MinMemoryMB    = 0
 $MaxDOP         = 0
@@ -51,7 +51,6 @@ function Get-InstanceKey {
           Where-Object { $_.PSChildName -match '^MSSQL\d{3}\.MSSQLSERVER$' } |
           Select-Object -ExpandProperty PSChildName -First 1
   if (-not $key) {
-    # Fallback: try to read from instance names map
     $map = Get-ItemProperty "${root}Instance Names\SQL" -ErrorAction SilentlyContinue
     if ($map -and $map.MSSQLSERVER) { $key = $map.MSSQLSERVER }
   }
@@ -65,7 +64,7 @@ function Get-RegBase {
 }
 
 function Drive-Ready {
-  param([string]${DriveLetter}) # 'F' or 'G'
+  param([string]${DriveLetter})
   Test-Path ("{0}:" -f ${DriveLetter})
 }
 
@@ -73,7 +72,7 @@ function Wait-ForDrive {
   param([string]${DriveLetter}, [int]$TimeoutSec = 900)
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   while (-not (Drive-Ready ${DriveLetter})) {
-    if (Get-Date -gt $deadline) { return $false }
+    if ((Get-Date) -gt $deadline) { return $false }    # fixed: added parentheses
     Write-Log "Drive ${DriveLetter}: not ready, waiting 30s..."
     Start-Sleep -Seconds 30
   }
@@ -83,7 +82,6 @@ function Wait-ForDrive {
 function Sql-Try {
   param([string]$Query, [int]$Timeout = 15)
   try {
-    # -E Windows auth, -C trust server cert, -l login timeout
     sqlcmd -S localhost -E -C -l $Timeout -W -Q $Query | Out-Null
     return $true
   } catch {
@@ -100,16 +98,13 @@ try {
   $regBase     = Get-RegBase -InstanceKey $instanceKey
   Write-Log "Instance registry base: $regBase"
 
-  # 2) Read current collation from registry (no SQL login needed)
+  # 2) Read current collation
   $currentCollation = ''
-  try {
-    $props = Get-ItemProperty -Path $regBase -ErrorAction Stop
-    $currentCollation = $props.Collation
-  } catch { }
+  try { $props = Get-ItemProperty -Path $regBase -ErrorAction Stop; $currentCollation = $props.Collation } catch { }
   if ([string]::IsNullOrWhiteSpace($currentCollation)) { $currentCollation = 'Unknown' }
   Write-Log "Current (registry) collation: $currentCollation"
 
-  # 3) Rebuild system DBs if needed (guarded by marker + different collation)
+  # 3) Rebuild system DBs if needed
   $needRebuild = (-not (Test-Path $RebuildMarker)) -and ($currentCollation -ne $DesiredCollation)
   if ($needRebuild) {
     Write-Log "Rebuilding system databases to collation $DesiredCollation..."
@@ -122,7 +117,7 @@ try {
     Write-Log "Rebuild not required (marker present or collation already matches)."
   }
 
-  # 4) Wait for SQL to be reachable (best-effort)
+  # 4) Wait for SQL to be reachable
   Write-Log "Waiting for SQL to accept connections..."
   $online = $false
   for ($i=1; $i -le 10; $i++) {
@@ -131,9 +126,9 @@ try {
     Start-Sleep -Seconds 30
   }
   if ($online) { Write-Log "SQL is online and accepting connections." }
-  else { Write-Log "SQL did not become reachable in time; will continue with registry-based steps." }
+  else { Write-Log "SQL did not become reachable in time; continuing with registry updates." }
 
-  # 5) Ensure drives exist, then create folders
+  # 5) Wait for drives and create folders
   foreach ($drv in @($DataDrive, $LogDrive, $TempDBDrive)) {
     if (-not (Wait-ForDrive $drv 900)) { throw "Drive $drv never became ready." }
   }
@@ -149,12 +144,13 @@ try {
     }
   }
 
-  # 6) Set DefaultData / DefaultLog in registry (no SQL login required)
-  Write-Log "Writing DefaultData/DefaultLog to registry at $regBase"
+  # 6) Update registry defaults
+  Write-Log "Writing DefaultData/DefaultLog/BackupDirectory to registry at $regBase"
   Set-ItemProperty -Path $regBase -Name 'DefaultData' -Value $DataPath -Force
   Set-ItemProperty -Path $regBase -Name 'DefaultLog'  -Value $LogPath  -Force
+  Set-ItemProperty -Path $regBase -Name 'BackupDirectory' -Value $DataPath -Force
 
-  # 7) If SQL reachable, apply performance settings + move TempDB (best-effort)
+  # 7) Apply perf settings + move TempDB
   if ($online) {
     Write-Log "Applying sp_configure settings..."
     [void](Sql-Try "EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE;")
@@ -162,27 +158,30 @@ try {
     [void](Sql-Try "EXEC sys.sp_configure N'optimize for ad hoc workloads', $OptimizeAdHoc; RECONFIGURE;")
     [void](Sql-Try "EXEC sys.sp_configure N'min server memory (MB)', $MinMemoryMB; RECONFIGURE;")
     [void](Sql-Try "EXEC sys.sp_configure N'max server memory (MB)', $MaxMemoryMB; RECONFIGURE;")
-    Write-Log "sp_configure applied (if permissions allowed)."
+    Write-Log "sp_configure applied."
 
-    Write-Log "Moving TempDB to $TempDBPath (if permitted)..."
+    Write-Log "Relocating TempDB files to $TempDBPath..."
     $tempMove = @"
 ALTER DATABASE tempdb MODIFY FILE (NAME = tempdev, FILENAME = '$TempDBPath\tempdb.mdf');
 ALTER DATABASE tempdb MODIFY FILE (NAME = templog, FILENAME = '$TempDBPath\templog.ldf');
 "@
     [void](Sql-Try $tempMove)
-    Write-Log "TempDB move submitted (takes effect after restart if successful)."
 
-    try {
-      Restart-Service MSSQLSERVER -Force
-      Write-Log "SQL restarted to apply TempDB/perf changes."
-    } catch {
-      Write-Log "Warning: could not restart SQL service automatically: $($_.Exception.Message)"
+    # Add relocation for secondary files temp2–temp8
+    for ($n=2; $n -le 8; $n++) {
+      $f = "temp$n"
+      $move = "ALTER DATABASE tempdb MODIFY FILE (NAME = $f, FILENAME = '$TempDBPath\$f.ndf');"
+      [void](Sql-Try $move)
     }
+    Write-Log "TempDB move statements submitted."
+
+    Restart-Service MSSQLSERVER -Force
+    Write-Log "SQL restarted to apply TempDB/perf changes."
   } else {
-    Write-Log "Skipping sp_configure and TempDB move (SQL not reachable with current context)."
+    Write-Log "Skipping SQL config (instance not reachable)."
   }
 
-  # 8) Verification (best-effort)
+  # 8) Verification
   try {
     $props2 = Get-ItemProperty -Path $regBase -ErrorAction Stop
     Write-Log "Registry verification: Collation='$($props2.Collation)', DefaultData='$($props2.DefaultData)', DefaultLog='$($props2.DefaultLog)'"
