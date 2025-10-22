@@ -19,7 +19,7 @@ terraform {
 
 provider "azurerm" {
   features {}
-  subscription_id = "6133c7a0-a417-43b9-acb9-1bdd65114bbe"
+  subscription_id = "03406327-efac-48f9-86da-67618104eec3"
 }
 
 locals {
@@ -88,9 +88,9 @@ locals {
 
 locals {
   vm_os_key = "server2022" # appease module validation
-  vm_name   = "htsjswsql001"
-  rg_name   = "rg-80020000-htsjswsql001"
-  region    = "eastus"
+  vm_name   = "hbm044cldtcd508"
+  rg_name   = "rg-20080000-multilex-non-prod"
+  region    = "uksouth"
 
   # File paths and URLs used for post-config persistence
   hts_root     = "C:\\ProgramData\\HTS"
@@ -112,11 +112,12 @@ module "sql_vm" {
   version = "~> 3.0.0"
 
   # --- Environment info ---
+  create_resource_group               = false
   resource_group_name                 = local.rg_name
   resource_group_location             = local.region
-  virtual_network_name                = "ht-hts-eastus-vnet1"
-  virtual_network_resource_group_name = "ht-hts-eastus-core-rg"
-  subnet_name                         = "ht-hts-eastus-utilityservices-app-prod-subnet-private"
+  virtual_network_name                = "vnet-10.123.52.0_23-southuk"
+  virtual_network_resource_group_name = "rg-20080000-Multilex-Non-Prod"
+  subnet_name                         = "default"
 
   # --- OS Info ---
   virtual_machine_os = local.vm_os_key
@@ -131,13 +132,14 @@ module "sql_vm" {
 
   # --- VM Info ---
   virtual_machine_name           = local.vm_name
-  virtual_machine_size           = "Standard_D8s_v5"
+  virtual_machine_size           = "Standard_D4s_v5"
   virtual_machine_admin_password = var.virtual_machine_admin_password
-  os_disk_disk_size_gb           = 256
+  os_disk_disk_size_gb           = 128
+  os_disk_storage_account_type   = "Premium_LRS"
 
   additional_disks = [
-    { volume_name = "sqldata", drive_letter = "f", disk_size_gb = 256 },
-    { volume_name = "sqllogs", drive_letter = "g", disk_size_gb = 128 },
+    { volume_name = "sqldata", drive_letter = "e", disk_size_gb = 1024, storage_account_type = "Premium_LRS" },
+    { volume_name = "snapshots", drive_letter = "g", disk_size_gb = 256, storage_account_type = "Premium_LRS" },
   ]
 
   # --- Chef Configuration ---
@@ -155,11 +157,11 @@ module "sql_vm" {
   tfc_worker_azure_private_key_base64 = var.tfc_worker_azure_private_key_base64
 
   # --- Tags ---
-  tag_costcenter   = "80020000"
-  tag_businessunit = "Hearst_Technology_Service"
-  tag_product      = "SQL_2025_Instance"
-  tag_application  = "Test_System"
-  tag_environment  = "prod"
+  tag_costcenter   = "20080000"
+  tag_businessunit = "First Data Bank"
+  tag_product      = "Multilex"
+  tag_application  = "rg-20080000-Multilex-Non-Prod"
+  tag_environment  = "dev"
   tag_supportteam  = "hts.sre@hearst.com"
 
   custom_tags = {
@@ -257,6 +259,34 @@ data "azurerm_virtual_machine" "sql_vm" {
   name                = local.vm_name
   resource_group_name = local.rg_name
   depends_on          = [module.sql_vm]
+}
+
+###############################################################
+# Network Security Group + NIC Association
+###############################################################
+resource "azurerm_network_security_group" "vm_nsg" {
+  name                = "${local.vm_name}-nsg"
+  location            = local.region
+  resource_group_name = local.rg_name
+}
+
+# Safely derive NIC name by appending "_nic" if your module follows that pattern
+# (the HTS module always creates NICs as <vm_name>_nic)
+locals {
+  vm_nic_name = "${local.vm_name}_nic"
+}
+
+# Look up the NIC explicitly by name
+data "azurerm_network_interface" "vm_nic" {
+  name                = local.vm_nic_name
+  resource_group_name = local.rg_name
+  depends_on          = [module.sql_vm]
+}
+
+# Attach NSG to that NIC
+resource "azurerm_network_interface_security_group_association" "vm_nic_nsg" {
+  network_interface_id      = data.azurerm_network_interface.vm_nic.id
+  network_security_group_id = azurerm_network_security_group.vm_nsg.id
 }
 
 ###############################################################
