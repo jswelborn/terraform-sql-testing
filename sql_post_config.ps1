@@ -7,7 +7,7 @@
   - Rebuilds system DBs to desired collation (first time only; guarded by marker)
   - Waits for data/log drives to appear
   - Writes DefaultData / DefaultLog / DefaultBackupDirectory in registry
-  - Applies sp_configure + relocates all TempDB files to F:\TempDB
+  - Applies sp_configure + relocates all TempDB files to E:\TempDB
   - Logs all actions to C:\Temp\sql_post_config.log
 #>
 
@@ -25,16 +25,16 @@ function Write-Log {
 Write-Log "=== SQL Post-Config Script Started ==="
 
 # ------------------ Tunables ------------------
-$InstanceName   = 'MSSQLSERVER'
+$InstanceName     = 'MSSQLSERVER'
 $DesiredCollation = 'SQL_Latin1_General_CP1_CS_AS'
-$DataDrive      = 'E'
-$LogDrive       = 'E'
-$TempDBDrive    = 'E'
-$MaxMemoryMB    = 2147483647
-$MinMemoryMB    = 0
-$MaxDOP         = 0
-$OptimizeAdHoc  = 1
-$RebuildMarker  = 'C:\Temp\_sql_rebuild_done.flag'
+$DataDrive        = 'E'
+$LogDrive         = 'E'
+$TempDBDrive      = 'E'
+$MaxMemoryMB      = 2147483647
+$MinMemoryMB      = 0
+$MaxDOP           = 0
+$OptimizeAdHoc    = 1
+$RebuildMarker    = 'C:\Temp\_sql_rebuild_done.flag'
 # ------------------------------------------------
 
 function Get-SetupExe {
@@ -72,7 +72,7 @@ function Wait-ForDrive {
   param([string]${DriveLetter}, [int]$TimeoutSec = 900)
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   while (-not (Drive-Ready ${DriveLetter})) {
-    if ((Get-Date) -gt $deadline) { return $false }    # fixed: added parentheses
+    if ((Get-Date) -gt $deadline) { return $false }
     Write-Log "Drive ${DriveLetter}: not ready, waiting 30s..."
     Start-Sleep -Seconds 30
   }
@@ -110,14 +110,40 @@ try {
     Write-Log "Rebuilding system databases to collation $DesiredCollation..."
     & $setupExe /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=$InstanceName /SQLSYSADMINACCOUNTS="Administrators" /SQLCOLLATION=$DesiredCollation
     Write-Log "System databases rebuild requested."
+
+    # --- NEW: Wait for setup.exe to fully exit ---
+    Write-Log "Checking for any active SQL setup.exe processes..."
+    $deadline = (Get-Date).AddMinutes(10)
+    while (Get-Process setup -ErrorAction SilentlyContinue) {
+      if ((Get-Date) -gt $deadline) {
+        Write-Log "Timeout waiting for setup.exe to exit."
+        break
+      }
+      Write-Log "setup.exe still running... waiting 30s"
+      Start-Sleep -Seconds 30
+    }
+    Write-Log "No active setup.exe processes detected. Proceeding."
+
     Restart-Service MSSQLSERVER -Force
     Write-Log "SQL Server restarted after rebuild."
     New-Item -ItemType File -Path $RebuildMarker -Force | Out-Null
+
+    # --- NEW: Verify SQL online after rebuild ---
+    Write-Log "Verifying SQL service availability post-rebuild..."
+    Start-Sleep -Seconds 30
+    for ($i=1; $i -le 10; $i++) {
+      if (Sql-Try "SELECT 1") {
+        Write-Log "SQL is online post-rebuild."
+        break
+      }
+      Write-Log "SQL not ready yet (attempt $i/10)..."
+      Start-Sleep -Seconds 30
+    }
   } else {
     Write-Log "Rebuild not required (marker present or collation already matches)."
   }
 
-  # 4) Wait for SQL to be reachable
+  # 4) Wait for SQL to be reachable (general readiness)
   Write-Log "Waiting for SQL to accept connections..."
   $online = $false
   for ($i=1; $i -le 10; $i++) {
@@ -167,7 +193,6 @@ ALTER DATABASE tempdb MODIFY FILE (NAME = templog, FILENAME = '$TempDBPath\templ
 "@
     [void](Sql-Try $tempMove)
 
-    # Add relocation for secondary files temp2–temp8
     for ($n=2; $n -le 8; $n++) {
       $f = "temp$n"
       $move = "ALTER DATABASE tempdb MODIFY FILE (NAME = $f, FILENAME = '$TempDBPath\$f.ndf');"
