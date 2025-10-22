@@ -5,6 +5,7 @@
 .DESCRIPTION
   - Detects proper instance registry path (MSSQL###.MSSQLSERVER)
   - Rebuilds system DBs to desired collation (first time only; guarded by marker)
+  - Waits for setup.exe to finish before retrying rebuild (prevents collation mismatch)
   - Waits for data/log drives to appear
   - Writes DefaultData / DefaultLog / DefaultBackupDirectory in registry
   - Applies sp_configure + relocates all TempDB files to E:\TempDB
@@ -108,50 +109,50 @@ try {
   $needRebuild = (-not (Test-Path $RebuildMarker)) -and ($currentCollation -ne $DesiredCollation)
   if ($needRebuild) {
     Write-Log "Rebuilding system databases to collation $DesiredCollation..."
-    & $setupExe /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=$InstanceName /SQLSYSADMINACCOUNTS="Administrators" /SQLCOLLATION=$DesiredCollation
-    Write-Log "System databases rebuild requested."
+    try {
+      & $setupExe /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=$InstanceName /SQLSYSADMINACCOUNTS="Administrators" /SQLCOLLATION=$DesiredCollation
+      Write-Log "System databases rebuild requested."
+    } catch {
+      Write-Log "Initial rebuild attempt failed: $($_.Exception.Message)"
+    }
 
-    # --- NEW: Wait for setup.exe to fully exit ---
+    # --- Wait for setup.exe to finish before retrying ---
     Write-Log "Checking for any active SQL setup.exe processes..."
     $deadline = (Get-Date).AddMinutes(10)
     while (Get-Process setup -ErrorAction SilentlyContinue) {
-      if ((Get-Date) -gt $deadline) {
-        Write-Log "Timeout waiting for setup.exe to exit."
-        break
-      }
+      if ((Get-Date) -gt $deadline) { Write-Log "Timeout waiting for setup.exe to exit"; break }
       Write-Log "setup.exe still running... waiting 30s"
       Start-Sleep -Seconds 30
     }
     Write-Log "No active setup.exe processes detected. Proceeding."
 
+    # --- Retry rebuild if needed ---
+    if (-not (Test-Path $RebuildMarker)) {
+      Write-Log "Retrying system database rebuild after setup.exe exit..."
+      try {
+        & $setupExe /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=$InstanceName /SQLSYSADMINACCOUNTS="Administrators" /SQLCOLLATION=$DesiredCollation
+        Write-Log "Rebuild retry initiated successfully."
+      } catch {
+        Write-Log "WARNING: Rebuild retry failed: $($_.Exception.Message)"
+      }
+    }
+
     Restart-Service MSSQLSERVER -Force
     Write-Log "SQL Server restarted after rebuild."
     New-Item -ItemType File -Path $RebuildMarker -Force | Out-Null
-
-    # --- NEW: Verify SQL online after rebuild ---
-    Write-Log "Verifying SQL service availability post-rebuild..."
-    Start-Sleep -Seconds 30
-    for ($i=1; $i -le 10; $i++) {
-      if (Sql-Try "SELECT 1") {
-        Write-Log "SQL is online post-rebuild."
-        break
-      }
-      Write-Log "SQL not ready yet (attempt $i/10)..."
-      Start-Sleep -Seconds 30
-    }
   } else {
     Write-Log "Rebuild not required (marker present or collation already matches)."
   }
 
-  # 4) Wait for SQL to be reachable (general readiness)
-  Write-Log "Waiting for SQL to accept connections..."
+  # 4) Post-rebuild verification
+  Write-Log "Verifying SQL service availability post-rebuild..."
   $online = $false
   for ($i=1; $i -le 10; $i++) {
     if (Sql-Try "SELECT 1") { $online = $true; break }
     Write-Log "SQL not ready yet (attempt $i/10)..."
     Start-Sleep -Seconds 30
   }
-  if ($online) { Write-Log "SQL is online and accepting connections." }
+  if ($online) { Write-Log "SQL is online post-rebuild." }
   else { Write-Log "SQL did not become reachable in time; continuing with registry updates." }
 
   # 5) Wait for drives and create folders
@@ -209,6 +210,10 @@ ALTER DATABASE tempdb MODIFY FILE (NAME = templog, FILENAME = '$TempDBPath\templ
   # 8) Verification
   try {
     $props2 = Get-ItemProperty -Path $regBase -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($props2.Collation)) {
+      Set-ItemProperty -Path $regBase -Name 'Collation' -Value $DesiredCollation -Force
+      Write-Log "Registry collation value manually set to $DesiredCollation"
+    }
     Write-Log "Registry verification: Collation='$($props2.Collation)', DefaultData='$($props2.DefaultData)', DefaultLog='$($props2.DefaultLog)'"
   } catch {
     Write-Log "Registry verification failed: $($_.Exception.Message)"
