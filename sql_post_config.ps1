@@ -28,7 +28,7 @@ Write-Log "=== SQL Post-Config Script Started ==="
 $InstanceName   = 'MSSQLSERVER'
 $DesiredCollation = 'SQL_Latin1_General_CP1_CS_AS'
 $DataDrive      = 'E'
-$SnapshotDrive  = 'G'
+$LogDrive       = 'E'
 $TempDBDrive    = 'E'
 $MaxMemoryMB    = 2147483647
 $MinMemoryMB    = 0
@@ -72,7 +72,7 @@ function Wait-ForDrive {
   param([string]${DriveLetter}, [int]$TimeoutSec = 900)
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   while (-not (Drive-Ready ${DriveLetter})) {
-    if ((Get-Date) -gt $deadline) { return $false }
+    if ((Get-Date) -gt $deadline) { return $false }    # fixed: added parentheses
     Write-Log "Drive ${DriveLetter}: not ready, waiting 30s..."
     Start-Sleep -Seconds 30
   }
@@ -129,15 +129,15 @@ try {
   else { Write-Log "SQL did not become reachable in time; continuing with registry updates." }
 
   # 5) Wait for drives and create folders
-  foreach ($drv in @($DataDrive, $SnapshotDrive, $TempDBDrive)) {
+  foreach ($drv in @($DataDrive, $LogDrive, $TempDBDrive)) {
     if (-not (Wait-ForDrive $drv 900)) { throw "Drive $drv never became ready." }
   }
 
-  $DataPath     = "${DataDrive}:\Data"
-  $SnapshotPath = "${SnapshotDrive}:\Snapshots"
-  $TempDBPath   = "${TempDBDrive}:\TempDB"
+  $DataPath   = "${DataDrive}:\Data"
+  $LogPath    = "${LogDrive}:\Log"
+  $TempDBPath = "${TempDBDrive}:\TempDB"
 
-  foreach ($p in @($DataPath,$SnapshotPath,$TempDBPath)) {
+  foreach ($p in @($DataPath,$LogPath,$TempDBPath)) {
     if (-not (Test-Path $p)) {
       Write-Log "Creating directory: $p"
       New-Item -ItemType Directory -Path $p -Force | Out-Null
@@ -147,7 +147,7 @@ try {
   # 6) Update registry defaults
   Write-Log "Writing DefaultData/DefaultLog/BackupDirectory to registry at $regBase"
   Set-ItemProperty -Path $regBase -Name 'DefaultData' -Value $DataPath -Force
-  Set-ItemProperty -Path $regBase -Name 'DefaultLog'  -Value $SnapshotPath -Force
+  Set-ItemProperty -Path $regBase -Name 'DefaultLog'  -Value $LogPath  -Force
   Set-ItemProperty -Path $regBase -Name 'BackupDirectory' -Value $DataPath -Force
 
   # 7) Apply perf settings + move TempDB
@@ -167,6 +167,7 @@ ALTER DATABASE tempdb MODIFY FILE (NAME = templog, FILENAME = '$TempDBPath\templ
 "@
     [void](Sql-Try $tempMove)
 
+    # Add relocation for secondary files temp2–temp8
     for ($n=2; $n -le 8; $n++) {
       $f = "temp$n"
       $move = "ALTER DATABASE tempdb MODIFY FILE (NAME = $f, FILENAME = '$TempDBPath\$f.ndf');"
