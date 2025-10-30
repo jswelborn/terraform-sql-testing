@@ -22,73 +22,9 @@ provider "azurerm" {
   subscription_id = "03406327-efac-48f9-86da-67618104eec3"
 }
 
+# Shared Locals
 locals {
-  virtual_machine_os = "server2022"
-}
-
-#module "windows_vm" {
-#  source  = "app.terraform.io/hts_automation/vm-windows/azure"
-#  version = "~> 3.0.0"
-
-# Env information
-#create_resource_group               = false
-#  resource_group_name                 = "rg-80020000-htsjswtest001"
-#  resource_group_location             = "eastus"
-#  virtual_network_name                = "ht-hts-eastus-vnet1"
-#  virtual_network_resource_group_name = "ht-hts-eastus-core-rg"
-#  subnet_name                         = "ht-hts-eastus-utilityservices-app-prod-subnet-private"
-
-# VM information
-#  virtual_machine_os             = local.virtual_machine_os
-#  virtual_machine_name           = "htsjswtest001"
-#  virtual_machine_size           = "Standard_D2_v5"
-#  virtual_machine_admin_password = var.virtual_machine_admin_password
-#  os_disk_disk_size_gb           = 127
-#  additional_disks = [
-#    {
-#      volume_name  = "extdisk10"
-#      drive_letter = "g"
-#      disk_size_gb = 10
-#    },
-#    {
-#      volume_name  = "extdisk20"
-#      drive_letter = "i"
-#      disk_size_gb = 20
-#    }
-#  ]
-
-
-#  chef_version               = "18.7.6"
-#  policy_name                = "hts_chef_base_node_pf"
-#  policy_group               = "staging"
-#  chef_client_action         = "run"
-#  domain_name                = "companynet.org"
-#  chef_validation_pem_base64 = var.chef_validation_pem_base64
-#  databag_secret_key         = var.databag_secret_key
-#  user_key_base64            = var.user_key_base64
-
-#  ad_dns_operations_app_runbook_url   = var.ad_dns_operations_app_runbook_url
-#  tfc_worker_azure_private_key_base64 = var.tfc_worker_azure_private_key_base64
-
-#  tag_costcenter   = "80020000"
-#  tag_businessunit = "Hearst_Technology_Service"
-#  tag_product      = "TFC_Module_Development"
-#  tag_application  = "Test_System"
-#  tag_environment  = "dev"
-#  tag_supportteam  = "hts.sre@hearst.com"
-#  custom_tags = {
-#    Monitoring      = "Datadog"
-#    AlertingProfile = "no_alerts"
-#  }
-#}
-
-###############################################################
-#  HTS SQL 2025 Windows VM — Chef-safe, Persistent Post-Config
-###############################################################
-
-locals {
-  vm_os_key = "server2022" # appease module validation
-  vm_name   = "hbm044cldtcd508"
+  vm_os_key = "server2025sql"
   rg_name   = "rg-20080000-multilex-non-prod"
   region    = "uksouth"
 
@@ -104,14 +40,11 @@ locals {
   main_uri     = "https://raw.githubusercontent.com/jswelborn/terraform-sql-testing/master/sql_post_config.ps1"
 }
 
-###############################################################
-#  VM Definition (via HTS Automation Windows module)
-###############################################################
-module "sql_vm" {
+#  SQL VM: hbm044cldtcd508
+module "sql_vm_hbm044cldtcd508" {
   source  = "app.terraform.io/hts_automation/vm-windows/azure"
-  version = "~> 3.0.0"
+  version = "~> 4.1.0"
 
-  # --- Environment info ---
   create_resource_group               = false
   resource_group_name                 = local.rg_name
   resource_group_location             = local.region
@@ -119,30 +52,19 @@ module "sql_vm" {
   virtual_network_resource_group_name = "rg-20080000-Multilex-Non-Prod"
   subnet_name                         = "default"
 
-  # --- OS Info ---
-  virtual_machine_os = local.vm_os_key
-  virtual_machine_os_details = {
-    server2022 = {
-      publisher = "MicrosoftSQLServer"
-      offer     = "SQL2025-WS2025"
-      sku       = "stddev-gen2"
-      version   = "latest"
-    }
-  }
-
-  # --- VM Info ---
-  virtual_machine_name           = local.vm_name
+  virtual_machine_os             = local.vm_os_key
+  virtual_machine_name           = "hbm044cldtcd508"
   virtual_machine_size           = "Standard_D4s_v5"
   virtual_machine_admin_password = var.virtual_machine_admin_password
   os_disk_disk_size_gb           = 128
   os_disk_storage_account_type   = "Premium_LRS"
+  virtual_machine_zone           = "1"
 
   additional_disks = [
-    { volume_name = "sqldata", drive_letter = "e", disk_size_gb = 1024, storage_account_type = "Premium_LRS" },
-    { volume_name = "snapshots", drive_letter = "g", disk_size_gb = 256, storage_account_type = "Premium_LRS" },
+    { volume_name = "sqldata", drive_letter = "e", disk_size_gb = 1024, storage_account_type = "PremiumV2_LRS" },
+    { volume_name = "snapshots", drive_letter = "g", disk_size_gb = 256, storage_account_type = "PremiumV2_LRS" },
   ]
 
-  # --- Chef Configuration ---
   chef_version               = "18.7.6"
   policy_name                = "hts_chef_base_node_pf"
   policy_group               = "staging"
@@ -152,11 +74,9 @@ module "sql_vm" {
   databag_secret_key         = var.databag_secret_key
   user_key_base64            = var.user_key_base64
 
-  # --- Azure AD/DNS automation ---
   ad_dns_operations_app_runbook_url   = var.ad_dns_operations_app_runbook_url
   tfc_worker_azure_private_key_base64 = var.tfc_worker_azure_private_key_base64
 
-  # --- Tags ---
   tag_costcenter   = "20080000"
   tag_businessunit = "First Data Bank"
   tag_product      = "Multilex"
@@ -169,147 +89,154 @@ module "sql_vm" {
     AlertingProfile = "no_alerts"
   }
 
-  ##################################################################
-  # Persisted SYSTEM Startup Task — Executes After Chef & Domain Join
-  ##################################################################
   post_chef_commands = <<EOT
-Write-Host "=== Persisting SQL post-config as SYSTEM startup task ==="
-$ErrorActionPreference = 'Stop'
-
-$rootDir    = "${local.hts_root}"
-$scriptsDir = "${local.hts_scripts}"
-$markersDir = "${local.hts_markers}"
-$tempDir    = "${local.temp_dir}"
-
-New-Item -ItemType Directory -Path $rootDir -Force | Out-Null
-New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
-New-Item -ItemType Directory -Path $markersDir -Force | Out-Null
-New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-
-$wrapperPath = Join-Path $scriptsDir "${local.wrapper_name}"
-$mainPath    = Join-Path $scriptsDir "${local.main_name}"
-$doneFlag    = Join-Path $markersDir "${local.done_flag}"
-$wrapperLog  = Join-Path $tempDir   "sql_post_config.wrapper.log"
-$mainLog     = Join-Path $tempDir   "sql_post_config.main.log"
-
-# --- Wrapper Script (idempotent + retry-safe) ---
-$wrapper = @"
-`$ErrorActionPreference = 'Stop'
-function Log([string]`$m){ `$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'; "`$ts :: `$m" | Tee-Object -FilePath "$wrapperLog" -Append | Out-Null }
-try {
-  Log "Wrapper starting (SYSTEM context expected)."
-  if (Test-Path "$doneFlag") {
-    Log "Done-flag present; exiting without action."
-    exit 0
-  }
-
-  Log "Fetching latest main script to $mainPath"
-  Invoke-WebRequest -UseBasicParsing -Uri "${local.main_uri}" -OutFile "$mainPath"
-
-  Log "Launching main script"
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$mainPath" *>> "$mainLog"
-  `$exit = `$LASTEXITCODE
-  Log "Main script exit code: `$exit"
-
-  if (`$exit -eq `$null -or `$exit -eq 0) {
-    Log "Main script succeeded; writing done-flag and disabling task."
-    New-Item -ItemType File -Path "$doneFlag" -Force | Out-Null
-    try { Disable-ScheduledTask -TaskName "${local.task_name}" -ErrorAction Stop | Out-Null } catch { Log "Disable failed: `$($_.Exception.Message)" }
-    exit 0
-  } else {
-    Log "Main script failed (code=`$exit); will retry next boot."
-    exit `$exit
-  }
-}
-catch {
-  Log "Wrapper error: `$($_.Exception.Message)"
-  exit 1
-}
-"@
-$wrapper | Set-Content -Path $wrapperPath -Encoding UTF8
-
-# --- Register SYSTEM Task (XML delay-safe variant) ---
-try {
-  $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`""
-  $trigger   = New-ScheduledTaskTrigger -AtStartup
-  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
-  $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
-
-  $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings
-  $xml = "$env:TEMP\\HTS_SQL_PostConfig_OnStartup.xml"
-  $task | Export-ScheduledTask | Set-Content $xml
-  (Get-Content $xml) -replace '</BootTrigger>', '<Delay>PT2M</Delay></BootTrigger>' | Set-Content $xml
-  Register-ScheduledTask -TaskName "${local.task_name}" -Xml (Get-Content $xml | Out-String) -Force | Out-Null
-  Remove-Item $xml -ErrorAction SilentlyContinue
-  Write-Host "Startup task registered successfully (2m delay)."
-  Start-ScheduledTask -TaskName "${local.task_name}"
-}
-catch {
-  Write-Host "Warning: failed to register/start scheduled task: $($_.Exception.Message)"
-}
-Write-Host "=== Persisted startup task registration complete ==="
-exit 0
+${file("${path.module}/sql_postconfig_task.ps1")}
 EOT
 }
 
-###############################################################
-# Lookup the VM to attach SQL IaaS configuration
-###############################################################
-data "azurerm_virtual_machine" "sql_vm" {
-  name                = local.vm_name
+data "azurerm_virtual_machine" "sql_vm_hbm044cldtcd508" {
+  name                = "hbm044cldtcd508"
   resource_group_name = local.rg_name
-  depends_on          = [module.sql_vm]
+  depends_on          = [module.sql_vm_hbm044cldtcd508]
 }
 
-###############################################################
-# Network Security Group + NIC Association
-###############################################################
-resource "azurerm_network_security_group" "vm_nsg" {
-  name                = "${local.vm_name}-nsg"
+resource "azurerm_network_security_group" "vm_nsg_hbm044cldtcd508" {
+  name                = "hbm044cldtcd508-nsg"
   location            = local.region
   resource_group_name = local.rg_name
 }
 
-# Safely derive NIC name by appending "_nic" if your module follows that pattern
-# (the HTS module always creates NICs as <vm_name>_nic)
 locals {
-  vm_nic_name = "${local.vm_name}_nic"
+  vm_nic_name_hbm044cldtcd508 = "hbm044cldtcd508_nic"
 }
 
-# Look up the NIC explicitly by name
-data "azurerm_network_interface" "vm_nic" {
-  name                = local.vm_nic_name
+data "azurerm_network_interface" "vm_nic_hbm044cldtcd508" {
+  name                = local.vm_nic_name_hbm044cldtcd508
   resource_group_name = local.rg_name
-  depends_on          = [module.sql_vm]
+  depends_on          = [module.sql_vm_hbm044cldtcd508]
 }
 
-# Attach NSG to that NIC
-resource "azurerm_network_interface_security_group_association" "vm_nic_nsg" {
-  network_interface_id      = data.azurerm_network_interface.vm_nic.id
-  network_security_group_id = azurerm_network_security_group.vm_nsg.id
+resource "azurerm_network_interface_security_group_association" "vm_nic_nsg_hbm044cldtcd508" {
+  network_interface_id      = data.azurerm_network_interface.vm_nic_hbm044cldtcd508.id
+  network_security_group_id = azurerm_network_security_group.vm_nsg_hbm044cldtcd508.id
 }
 
-###############################################################
-# Register the SQL VM with Azure SQL IaaS
-###############################################################
-resource "azurerm_mssql_virtual_machine" "sql_config" {
-  virtual_machine_id = data.azurerm_virtual_machine.sql_vm.id
+resource "azurerm_mssql_virtual_machine" "sql_config_hbm044cldtcd508" {
+  virtual_machine_id = data.azurerm_virtual_machine.sql_vm_hbm044cldtcd508.id
   sql_license_type   = "PAYG"
 
   lifecycle {
     ignore_changes = [tags]
   }
 
-  depends_on = [data.azurerm_virtual_machine.sql_vm]
+  depends_on = [data.azurerm_virtual_machine.sql_vm_hbm044cldtcd508]
 }
 
-###############################################################
-# Outputs (optional)
-###############################################################
-output "vm_id" {
-  value = data.azurerm_virtual_machine.sql_vm.id
+output "vm_id_hbm044cldtcd508" {
+  value = data.azurerm_virtual_machine.sql_vm_hbm044cldtcd508.id
 }
 
-output "sql_vm_resource_id" {
-  value = azurerm_mssql_virtual_machine.sql_config.id
+output "sql_vm_resource_id_hbm044cldtcd508" {
+  value = azurerm_mssql_virtual_machine.sql_config_hbm044cldtcd508.id
+}
+
+
+# SQL VM: hbm044cldtcd509 
+module "sql_vm_hbm044cldtcd509" {
+  source  = "app.terraform.io/hts_automation/vm-windows/azure"
+  version = "~> 4.1.0"
+
+  create_resource_group               = false
+  resource_group_name                 = local.rg_name
+  resource_group_location             = local.region
+  virtual_network_name                = "vnet-10.123.52.0_23-southuk"
+  virtual_network_resource_group_name = "rg-20080000-Multilex-Non-Prod"
+  subnet_name                         = "default"
+
+  virtual_machine_os             = local.vm_os_key
+  virtual_machine_name           = "hbm044cldtcd509"
+  virtual_machine_size           = "Standard_D4s_v5"
+  virtual_machine_admin_password = var.virtual_machine_admin_password
+  os_disk_disk_size_gb           = 128
+  os_disk_storage_account_type   = "Premium_LRS"
+  virtual_machine_zone           = "1"
+
+  additional_disks = [
+    { volume_name = "sqldata", drive_letter = "e", disk_size_gb = 1024, storage_account_type = "PremiumV2_LRS" },
+    { volume_name = "snapshots", drive_letter = "g", disk_size_gb = 256, storage_account_type = "PremiumV2_LRS" },
+  ]
+
+  chef_version               = "18.7.6"
+  policy_name                = "hts_chef_base_node_pf"
+  policy_group               = "staging"
+  chef_client_action         = "run"
+  domain_name                = "companynet.org"
+  chef_validation_pem_base64 = var.chef_validation_pem_base64
+  databag_secret_key         = var.databag_secret_key
+  user_key_base64            = var.user_key_base64
+
+  ad_dns_operations_app_runbook_url   = var.ad_dns_operations_app_runbook_url
+  tfc_worker_azure_private_key_base64 = var.tfc_worker_azure_private_key_base64
+
+  tag_costcenter   = "20080000"
+  tag_businessunit = "First Data Bank"
+  tag_product      = "Multilex"
+  tag_application  = "rg-20080000-Multilex-Non-Prod"
+  tag_environment  = "dev"
+  tag_supportteam  = "hts.sre@hearst.com"
+
+  custom_tags = {
+    Monitoring      = "Datadog"
+    AlertingProfile = "no_alerts"
+  }
+
+  post_chef_commands = <<EOT
+${file("${path.module}/sql_postconfig_task.ps1")}
+EOT
+}
+
+data "azurerm_virtual_machine" "sql_vm_hbm044cldtcd509" {
+  name                = "hbm044cldtcd509"
+  resource_group_name = local.rg_name
+  depends_on          = [module.sql_vm_hbm044cldtcd509]
+}
+
+resource "azurerm_network_security_group" "vm_nsg_hbm044cldtcd509" {
+  name                = "hbm044cldtcd509-nsg"
+  location            = local.region
+  resource_group_name = local.rg_name
+}
+
+locals {
+  vm_nic_name_hbm044cldtcd509 = "hbm044cldtcd509_nic"
+}
+
+data "azurerm_network_interface" "vm_nic_hbm044cldtcd509" {
+  name                = local.vm_nic_name_hbm044cldtcd509
+  resource_group_name = local.rg_name
+  depends_on          = [module.sql_vm_hbm044cldtcd509]
+}
+
+resource "azurerm_network_interface_security_group_association" "vm_nic_nsg_hbm044cldtcd509" {
+  network_interface_id      = data.azurerm_network_interface.vm_nic_hbm044cldtcd509.id
+  network_security_group_id = azurerm_network_security_group.vm_nsg_hbm044cldtcd509.id
+}
+
+resource "azurerm_mssql_virtual_machine" "sql_config_hbm044cldtcd509" {
+  virtual_machine_id = data.azurerm_virtual_machine.sql_vm_hbm044cldtcd509.id
+  sql_license_type   = "PAYG"
+
+  lifecycle {
+    ignore_changes = [tags]
+  }
+
+  depends_on = [data.azurerm_virtual_machine.sql_vm_hbm044cldtcd509]
+}
+
+output "vm_id_hbm044cldtcd509" {
+  value = data.azurerm_virtual_machine.sql_vm_hbm044cldtcd509.id
+}
+
+output "sql_vm_resource_id_hbm044cldtcd509" {
+  value = azurerm_mssql_virtual_machine.sql_config_hbm044cldtcd509.id
 }
