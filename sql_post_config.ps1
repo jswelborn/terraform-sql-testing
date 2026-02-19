@@ -1,3 +1,7 @@
+# =========================
+# sql_post_config.ps1
+# (UPDATED: adds -b in Sql-Try and the SqlIaaSExtensionQuery sysadmin grant)
+# =========================
 <#
 .SYNOPSIS
   Idempotent post-deployment SQL Server configuration for Azure SQL VMs.
@@ -9,6 +13,7 @@
   - Waits for data/log drives to appear
   - Writes DefaultData / DefaultLog / DefaultBackupDirectory in registry
   - Applies sp_configure + relocates all TempDB files to E:\TempDB
+  - Ensures NT Service\SqlIaaSExtensionQuery is sysadmin (required by SQL IaaS extension)
   - Logs all actions to C:\Temp\sql_post_config.log
 #>
 
@@ -83,7 +88,8 @@ function Wait-ForDrive {
 function Sql-Try {
   param([string]$Query, [int]$Timeout = 15)
   try {
-    sqlcmd -S localhost -E -C -l $Timeout -W -Q $Query | Out-Null
+    # -b makes sqlcmd exit non-zero on SQL errors so the catch is meaningful.
+    sqlcmd -S localhost -E -C -b -l $Timeout -W -Q $Query | Out-Null
     return $true
   } catch {
     return $false
@@ -154,6 +160,22 @@ try {
   }
   if ($online) { Write-Log "SQL is online post-rebuild." }
   else { Write-Log "SQL did not become reachable in time; continuing with registry updates." }
+
+  # 4.1) Ensure SQL IaaS Extension query account is sysadmin
+  if ($online) {
+    Write-Log "Ensuring SQL IaaS Extension query account is sysadmin..."
+    $grant = @"
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'NT Service\SqlIaaSExtensionQuery')
+    CREATE LOGIN [NT Service\SqlIaaSExtensionQuery] FROM WINDOWS;
+ALTER SERVER ROLE [sysadmin] ADD MEMBER [NT Service\SqlIaaSExtensionQuery];
+"@
+    if (-not (Sql-Try $grant 30)) {
+      throw "Failed to grant sysadmin to NT Service\SqlIaaSExtensionQuery"
+    }
+    Write-Log "Ensured NT Service\SqlIaaSExtensionQuery is sysadmin."
+  } else {
+    Write-Log "Skipping sysadmin grant (SQL not reachable)."
+  }
 
   # 5) Wait for drives and create folders
   foreach ($drv in @($DataDrive, $LogDrive, $TempDBDrive)) {
