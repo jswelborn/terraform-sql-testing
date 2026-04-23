@@ -33,9 +33,9 @@ Write-Log "=== SQL Post-Config Script Started ==="
 # ------------------ Tunables ------------------
 $InstanceName     = 'MSSQLSERVER'
 $DesiredCollation = 'SQL_Latin1_General_CP1_CS_AS'
-$DataDrive        = 'F'
-$LogDrive         = 'F'
-$TempDBDrive      = 'F'
+$DataDrive        = 'E'
+$LogDrive         = 'E'
+$TempDBDrive      = 'E'
 $MaxMemoryMB      = 2147483647
 $MinMemoryMB      = 0
 $MaxDOP           = 0
